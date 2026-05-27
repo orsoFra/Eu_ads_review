@@ -1,0 +1,1059 @@
+---
+title: "analysis_EU_election_MVP"
+author: "Dominik Bär"
+date: "2025-01-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# File description
+
+```{r}
+# Reviewer-facing MVP for the paper "Gender-based discrepancies in the algorithmic delivery
+# of political ads on social media".
+#
+# Scope retained from the original analysis file:
+# - Descriptive analysis for populist vs. non-populist ads (Figure 1)
+# - Main regression and marginal effect for populist ads (Figures 2 and 3)
+# - Descriptive analysis for far-left / center / far-right ads (Figure 4)
+# - Extremism regression (Figure 5)
+# - Supplement B robustness checks
+# - Supplement C interaction between populism and political extremism
+#
+# Exploratory sections not reported in the paper were removed to make the script suitable
+# for reviewer replication.
+```
+
+# Set up environment
+
+```{r, include=FALSE}
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(arrow)
+library(tidyverse)
+library(lubridate)
+library(ggrepel)
+library(MatchIt)
+library(WeightIt)
+library(cobalt)
+library(marginaleffects)
+library(lme4)
+library(broom)
+library(sandwich)
+library(clubSandwich)
+library(lmtest)
+library(ggpattern)
+library(ggeffects)
+library(sf)
+library(grid)
+
+# Load helpers used in the original project
+if (file.exists("utils.R")) {
+  source("utils.R")
+}
+
+# Fallback for a helper that is used throughout the original analysis file
+if (!exists("extract_coef_inference")) {
+  extract_coef_inference <- function(inference_obj) {
+    coef_df <- broom::tidy(inference_obj)
+    coef_df %>%
+      mutate(
+        conf.low.95 = estimate - qnorm(0.975) * std.error,
+        conf.high.95 = estimate + qnorm(0.975) * std.error,
+        conf.low.99 = estimate - qnorm(0.995) * std.error,
+        conf.high.99 = estimate + qnorm(0.995) * std.error
+      )
+  }
+}
+
+if (!exists("perform_psm")) {
+  stop("perform_psm() is expected from utils.R for Supplement B.4.")
+}
+
+# Set seed
+set.seed(42)
+
+# Define paths to data and output
+path_data <- "../../Data/"
+path_figures <- "../../Doc/Nat Hum Behav/figures/"
+dir.create(path_figures, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Graph theme setup
+
+```{r}
+theme_set(
+  theme_bw() +
+    theme(
+      legend.position = c(0.7, 0.9),
+      legend.title = element_blank(),
+      legend.direction = "horizontal",
+      legend.text = element_text(colour = "black", size = 12),
+      legend.background = element_rect(fill = "transparent", colour = NA),
+      legend.key = element_rect(fill = "transparent", colour = "transparent"),
+      legend.key.width = unit(0.5, "cm"),
+      legend.key.height = unit(0.5, "cm"),
+      axis.text.x = element_text(colour = "black", size = 12, vjust = 0.5),
+      axis.text.y = element_text(colour = "black", size = 12, vjust = 0.5),
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12, vjust = 1.5)
+    )
+)
+
+# Color mappings used in the original script
+extremist_colors <- c("darkred", "darkgreen", "darkblue")
+populist_colors <- c("darkcyan", "darkorange")
+```
+
+# Load and prepare data
+
+```{r}
+# Load ad data
+ad_data <- read_parquet(str_c(path_data, "ad_library/", "EU_2024_ad_library_preprocessed.parquet")) %>%
+  as_tibble()
+
+# Unnest targeting and observed-audience columns
+ad_data <- ad_data %>%
+  unnest_wider(targeting_gender_distribution, names_sep = "_") %>%
+  unnest_wider(targeting_age_distribution, names_sep = "_") %>%
+  unnest_wider(actual_gender_distribution_unique_views, names_sep = "_") %>%
+  unnest_wider(actual_age_distribution_unique_views, names_sep = "_")
+
+ad_data <- ad_data %>%
+  rename_with(~ str_replace_all(., "-", "_"), matches("targeting_age_distribution|actual_age_distribution_unique_views")) %>%
+  rename_with(~ str_replace_all(., "\\+", ""), matches("targeting_age_distribution|actual_age_distribution_unique_views"))
+
+# Vector of countries
+countries <- ad_data %>%
+  distinct(country) %>%
+  pull(country)
+
+# Define covariates from the original script
+ad_vars <- c(
+  "platform",
+  "ad_duration_scaled",
+  "n_active_ads_country_scaled",
+  "party_ad",
+  "sentiment",
+  "weekday_start",
+  "weekday_end"
+)
+
+targeting <- ad_data %>%
+  select(contains("targeting_age_distribution") & !contains("13_17")) %>%
+  colnames()
+
+male_share_country <- c("FB_male_total_country", "IG_male_total_country")
+
+covariates <- c(ad_vars, targeting)
+
+# Prepare analysis sample
+model_df <- ad_data %>%
+  filter(eu_parliament_2024 == 1) %>%
+  filter(target_gender == "All") %>%
+  mutate(
+    excess_male_audience = actual_gender_distribution_unique_views_male - actual_gender_distribution_unique_views_female,
+    populist = as.integer(ifelse(is.na(populist), 0, populist)),
+    populist = factor(populist, levels = c(0, 1), labels = c("Non-populist", "Populist")),
+    farright = as.integer(ifelse(is.na(farright), 0, farright)),
+    farleft = as.integer(ifelse(is.na(farleft), 0, farleft)),
+    extremist = ifelse(farright == 1, "Farright", ifelse(farleft == 1, "Farleft", "Center")),
+    extremist = factor(extremist, levels = c("Center", "Farleft", "Farright"), labels = c("Center", "Farleft", "Farright")),
+    platform = factor(platform, levels = c("FB_IG", "FB", "IG"), labels = c("Facebook and Instagram", "Facebook", "Instagram")),
+    sentiment = factor(sentiment, levels = c("neutral", "positive", "negative"), labels = c("Neutral", "Positive", "Negative")),
+    across(.cols = c(weekday_start, weekday_end), ~ as_factor(.x)),
+    across(.cols = c(n_active_ads_country, ad_duration, spend), ~ scale(.x) %>% as.vector(), .names = "{.col}_scaled")
+  )
+```
+
+# Descriptive statistics reported in the paper
+
+```{r}
+# Overlap between populist and extremist classifications
+model_df %>%
+  filter(populist == "Populist" & extremist %in% c("Farleft", "Farright")) %>%
+  nrow()
+
+model_df %>%
+  filter(populist == "Populist") %>%
+  group_by(extremist) %>%
+  summarize(n = n(), .groups = "drop")
+
+# Share of populist ads in the estimation sample
+model_df %>%
+  group_by(populist) %>%
+  summarize(share_ads = n() / nrow(model_df), .groups = "drop")
+
+# Overall male / female audience shares
+model_df %>%
+  summarize(
+    male_share = mean(actual_gender_distribution_unique_views_male, na.rm = TRUE),
+    female_share = mean(actual_gender_distribution_unique_views_female, na.rm = TRUE)
+  )
+
+# Average excess male share for non-populist ads
+model_df %>%
+  filter(populist == "Non-populist") %>%
+  summarize(mean_excess_male = mean(excess_male_audience, na.rm = TRUE))
+```
+
+# Figure 1: Populist vs. non-populist descriptive analysis
+
+## Figure 1a: Country-level difference in male audience share
+
+```{r}
+fig1a_df <- model_df %>%
+  group_by(country, populist) %>%
+  summarize(
+    male_share = mean(actual_gender_distribution_unique_views_male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = populist, values_from = male_share) %>%
+  mutate(
+    diff = Populist - `Non-populist`,
+    direction = case_when(
+      is.na(Populist) ~ "No populist ads",
+      diff >= 0 ~ "Populist > Non-populist",
+      TRUE ~ "Populist < Non-populist"
+    ),
+    label_diff = case_when(
+      is.na(diff) ~ NA_character_,
+      TRUE ~ sprintf("%+.1f%%", diff * 100)
+    )
+  ) %>%
+  arrange(desc(coalesce(Populist, `Non-populist`))) %>%
+  mutate(country = factor(country, levels = rev(country)))
+
+fig1a_plot <- ggplot(fig1a_df, aes(y = country)) +
+  geom_segment(
+    data = fig1a_df %>% filter(direction != "No populist ads"),
+    aes(
+      x = `Non-populist`,
+      xend = Populist,
+      yend = country,
+      color = direction
+    ),
+    linewidth = 0.9,
+    arrow = grid::arrow(length = grid::unit(0.10, "inches"), type = "closed")
+  ) +
+  geom_point(
+    aes(x = `Non-populist`, color = direction),
+    size = 1.8
+  ) +
+  geom_text(
+    data = fig1a_df %>% filter(direction != "No populist ads"),
+    aes(x = pmax(`Non-populist`, Populist) + 0.012, label = label_diff, color = direction),
+    hjust = 0,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Populist > Non-populist" = "#2B6CB0",
+      "Populist < Non-populist" = "#C44E52",
+      "No populist ads" = "black"
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(0.40, 0.72),
+    breaks = seq(0.40, 0.70, by = 0.05),
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.01, 0.10))
+  ) +
+  labs(
+    x = "Share of unique views by male users",
+    y = NULL,
+    color = NULL
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = c(0.82, 0.15),
+    legend.background = element_rect(fill = "transparent", colour = NA),
+    panel.grid.minor = element_blank()
+  )
+
+fig1a_plot
+
+ggsave(
+  filename = file.path(path_figures, "figure1a_populist_country_difference.pdf"),
+  plot = fig1a_plot,
+  width = 8,
+  height = 6,
+  device = cairo_pdf
+)
+```
+
+## Map data
+
+```{r}
+map_data <- read_sf(dsn = str_c(path_data, "misc/world_shape_files/ne_10m_admin_0_countries.shp")) %>%
+  st_as_sf()
+
+# Handle Cyprus explicitly, mirroring the original script
+cyprus_geometry <- map_data %>%
+  filter(str_detect(NAME, "Cyprus")) %>%
+  mutate(ISO_A2_EH = "CY") %>%
+  group_by(ISO_A2_EH) %>%
+  summarise() %>%
+  st_geometry()
+
+eu <- map_data %>%
+  filter(ISO_A2_EH %in% countries, TYPE %in% c("Country", "Sovereign country")) %>%
+  select(ISO_A2_EH, geometry) %>%
+  mutate(
+    geometry = case_when(
+      ISO_A2_EH == "CY" ~ cyprus_geometry,
+      TRUE ~ geometry
+    ),
+    pattern = case_when(
+      ISO_A2_EH %in% c("PT", "FR") ~ "crosshatch",
+      TRUE ~ "stripe"
+    )
+  )
+
+lambert_crs <- 3035
+xlim_europe <- c(2500000, 6500000)
+ylim_europe <- c(1050000, 5300000)
+
+map_base <- ggplot() +
+  geom_sf(data = map_data, aes(geometry = geometry), fill = "lightgrey", color = "white", size = 0.1) +
+  geom_sf_pattern(
+    data = eu %>% filter(!(ISO_A2_EH %in% c("FR", "PT"))),
+    aes(geometry = geometry, pattern = pattern, pattern_fill = pattern, fill = pattern),
+    pattern_density = 0.2,
+    pattern_spacing = 0.03,
+    pattern_angle = 45,
+    pattern_color = "black",
+    fill = "lightgrey",
+    color = "white",
+    size = 0.1
+  ) +
+  geom_sf_pattern(
+    data = eu %>% filter(ISO_A2_EH %in% c("FR", "PT")),
+    aes(geometry = geometry, pattern = pattern, pattern_fill = pattern),
+    pattern_density = 0.5,
+    pattern_spacing = 0.03,
+    pattern_angle = 90,
+    pattern_color = "darkred",
+    fill = "lightgrey",
+    color = "white",
+    size = 0.1
+  ) +
+  scale_pattern_manual(values = c("stripe" = "stripe", "crosshatch" = "stripe"), labels = c("Ads prohibited", "No data")) +
+  scale_pattern_fill_manual(values = c("stripe" = "black", "crosshatch" = "darkred"), labels = c("Ads prohibited", "No data")) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    axis.text.y = element_blank(),
+    axis.text.x = element_blank(),
+    legend.spacing.y = unit(0.1, "cm"),
+    legend.box = "vertical",
+    legend.box.spacing = unit(0.5, "cm")
+  )
+```
+
+## Figure 1b: Populist vs. non-populist excess male share map
+
+```{r}
+fig1b_df <- model_df %>%
+  group_by(country, populist) %>%
+  summarize(
+    excess_male_audience = mean(excess_male_audience, na.rm = TRUE),
+    actual_gender_distribution_unique_views_male = mean(actual_gender_distribution_unique_views_male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  right_join(eu, by = c("country" = "ISO_A2_EH")) %>%
+  mutate(populist = forcats::fct_relevel(populist, "Non-populist", "Populist")) %>%
+  drop_na(populist) %>%
+  st_as_sf()
+
+map_populist_excess_male <- map_base +
+  geom_sf(data = fig1b_df, aes(geometry = geometry, fill = excess_male_audience), color = "white", size = 0.1) +
+  coord_sf(crs = lambert_crs, xlim = xlim_europe, ylim = ylim_europe) +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkblue",
+    midpoint = 0,
+    limits = c(-0.25, 0.45),
+    breaks = seq(-0.2, 0.4, 0.2),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  facet_wrap(~ populist, nrow = 1, ncol = 2) +
+  guides(
+    fill = guide_colorbar(barwidth = unit(10, "cm"), barheight = unit(0.5, "cm"), order = 1)
+  )
+
+map_populist_excess_male
+
+ggsave(
+  filename = str_c(path_figures, "map_excess_views_male_populist.svg"),
+  plot = map_populist_excess_male,
+  width = 20,
+  height = 10,
+  units = "cm"
+)
+```
+
+# Media embeddings as visual content controls
+
+```{r}
+embeddings <- read_parquet(str_c(path_data, "ad_library/", "content_embeddings.parquet")) %>%
+  as_tibble()
+
+id_var <- "id"
+
+emb_cols <- names(embeddings)[str_detect(names(embeddings), "^(content_embedding_|emb_|media_emb_|dim_)")]
+if (length(emb_cols) == 0) {
+  emb_cols <- setdiff(names(embeddings %>% select(where(is.numeric))), id_var)
+}
+
+message("Embedding dimensions used: ", length(emb_cols))
+
+embeddings_ad <- embeddings %>%
+  group_by(.data[[id_var]]) %>%
+  summarise(across(all_of(emb_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  semi_join(model_df %>% select(all_of(id_var)) %>% distinct(), by = id_var)
+
+keep_emb_cols <- embeddings_ad %>%
+  summarise(across(all_of(emb_cols), ~ sd(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "sd") %>%
+  filter(!is.na(sd) & sd > 0) %>%
+  pull(term)
+
+pca_media <- prcomp(
+  embeddings_ad %>% select(all_of(keep_emb_cols)),
+  center = TRUE,
+  scale. = TRUE
+)
+
+explained_var <- (pca_media$sdev^2) / sum(pca_media$sdev^2)
+cum_explained_var <- cumsum(explained_var)
+K <- which(cum_explained_var >= 0.80)[1]
+
+message("Retaining ", K, " PCs (", round(cum_explained_var[K] * 100, 1), "% variance explained)")
+
+media_pcs <- as_tibble(pca_media$x[, seq_len(K), drop = FALSE]) %>%
+  setNames(str_c("media_pc_", seq_len(K))) %>%
+  mutate(!!id_var := embeddings_ad[[id_var]])
+
+model_df_media <- model_df %>%
+  left_join(media_pcs, by = id_var) %>%
+  mutate(
+    has_media_embedding = as.integer(!is.na(media_pc_1)),
+    across(starts_with("media_pc_"), ~ tidyr::replace_na(.x, 0))
+  )
+
+media_covariates <- c(
+  "has_media_embedding",
+  names(model_df_media %>% select(starts_with("media_pc_")))
+)
+
+# Covariate blocks for the paper and Supplement B.5
+covariates_base <- ad_vars
+covariates_age <- c(ad_vars, targeting)
+covariates_media_only <- c(ad_vars, media_covariates)
+covariates_media <- c(ad_vars, targeting, media_covariates)
+```
+
+# Main regression analysis (paper Figures 2, 3, and 5)
+
+```{r}
+# Main dependent variable in the paper
+dep_var <- "excess_male_audience"
+
+# Populist model with age-targeting and media controls
+formula_populist_media <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_media, collapse = " + "), " + country"
+))
+
+lm_populist_media <- lm(formula_populist_media, data = model_df_media)
+
+inference_populist_media <- coeftest(
+  lm_populist_media,
+  vcov. = vcovCL(lm_populist_media, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+
+coef_populist_media <- extract_coef_inference(inference_populist_media)
+coef_populist_media %>% filter(term == "populistPopulist")
+
+# Extremism model with the same controls
+formula_extremist_media <- as.formula(str_c(
+  dep_var, " ~ extremist + ", paste(covariates_media, collapse = " + "), " + country"
+))
+
+lm_extremist_media <- lm(formula_extremist_media, data = model_df_media)
+
+inference_extremist_media <- coeftest(
+  lm_extremist_media,
+  .vcov = vcovCL(lm_extremist_media, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+
+coef_extremist_media <- extract_coef_inference(inference_extremist_media)
+coef_extremist_media %>% filter(str_detect(term, "extremist"))
+```
+
+```{r}
+covariates_media
+```
+
+
+## Figure 2: Coefficient plot for selected populist-model coefficients
+
+```{r}
+coef_df_fig2 <- broom::tidy(inference_populist_media, conf.int = TRUE, conf.level = 0.95)
+
+plot_data_fig2 <- coef_df_fig2 %>%
+  filter(term %in% c(
+    "populistPopulist",
+    "platformFacebook",
+    "platformInstagram",
+    "party_ad",
+    "sentimentPositive",
+    "sentimentNegative"
+  )) %>%
+  mutate(
+    clean_term = case_when(
+      term == "populistPopulist" ~ "Populist",
+      term == "platformFacebook" ~ "Facebook",
+      term == "platformInstagram" ~ "Instagram",
+      term == "party_ad" ~ "Party Ad",
+      term == "sentimentPositive" ~ "Positive Sentiment",
+      term == "sentimentNegative" ~ "Negative Sentiment"
+    ),
+    clean_term = factor(
+      clean_term,
+      levels = rev(c("Populist", "Facebook", "Instagram", "Party Ad", "Positive Sentiment", "Negative Sentiment"))
+    )
+  )
+
+table1_coef_plot <- ggplot(plot_data_fig2, aes(x = estimate, y = clean_term)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    color = "darkblue",
+    fill = "darkblue",
+    shape = 21,
+    size = 0.8,
+    linewidth = 1
+  ) +
+  labs(
+    x = "Effect on Excess Share of Male Audience",
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(color = "black", size = 12),
+    axis.text.x = element_text(color = "black", size = 12)
+  )
+
+print(table1_coef_plot)
+
+ggsave(
+  filename = file.path(path_figures, "table1_coef_plot.pdf"),
+  plot = table1_coef_plot,
+  width = 18,
+  height = 10,
+  units = "cm"
+)
+```
+
+## Figure 3: Marginal effect of populism on excess male share
+
+```{r}
+gge_populist <- predict_response(
+  lm_populist_media,
+  terms = "populist",
+  vcov_fun = vcovCL(lm_populist_media, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+
+plot_effect_populist <- ggplot(gge_populist, aes(x = x, y = predicted)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = x), width = 0.2, linewidth = 1) +
+  geom_point(aes(color = x), size = 3) +
+  scale_color_manual(values = populist_colors) +
+  xlab("") +
+  ylab("Predicted excess male share") +
+  theme(legend.position = "none")
+
+plot_effect_populist
+
+ggsave(
+  filename = str_c(path_figures, "plot_effect_populist.pdf"),
+  plot = plot_effect_populist,
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+```
+
+# Figure 4: The role of political extremism
+
+## Figure 4a: Female and male audience shares by country and ideological bloc
+
+```{r}
+df_extremist_gender <- model_df %>%
+  filter(
+    !is.na(country),
+    !is.na(extremist),
+    !is.na(actual_gender_distribution_unique_views_female),
+    !is.na(actual_gender_distribution_unique_views_male)
+  ) %>%
+  mutate(
+    extremist = factor(extremist, levels = c("Center", "Farleft", "Farright"))
+  ) %>%
+  group_by(country, extremist) %>%
+  summarize(
+    Female = mean(actual_gender_distribution_unique_views_female, na.rm = TRUE),
+    Male = mean(actual_gender_distribution_unique_views_male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(Female, Male),
+    names_to = "gender",
+    values_to = "share"
+  ) %>%
+  mutate(
+    gender = factor(gender, levels = c("Female", "Male")),
+    country = factor(country, levels = sort(unique(country), decreasing = TRUE))
+  ) %>%
+  complete(
+    country,
+    extremist = factor(c("Center", "Farleft", "Farright"), levels = c("Center", "Farleft", "Farright")),
+    gender = factor(c("Female", "Male"), levels = c("Female", "Male")),
+    fill = list(share = NA_real_)
+  )
+
+country_levels <- levels(df_extremist_gender$country)
+country_gap <- 3.1
+bar_offset <- 0.8
+bar_width <- 0.75
+
+df_extremist_gender <- df_extremist_gender %>%
+  mutate(
+    country_id = as.numeric(country) * country_gap,
+    extremist_offset = case_when(
+      extremist == "Center" ~ -bar_offset,
+      extremist == "Farleft" ~ 0,
+      extremist == "Farright" ~ bar_offset
+    ),
+    y_pos = country_id + extremist_offset
+  )
+
+extremist_colors_bar <- c(
+  "Center" = "grey",
+  "Farleft" = "#C44E7F",
+  "Farright" = "#2B6CB0"
+)
+
+plot_extremist_gender_bar <- ggplot(
+  df_extremist_gender,
+  aes(
+    x = share,
+    y = y_pos,
+    fill = extremist
+  )
+) +
+  geom_col(
+    width = bar_width,
+    orientation = "y",
+    na.rm = TRUE
+  ) +
+  facet_wrap(~ gender, nrow = 1) +
+  scale_fill_manual(values = extremist_colors_bar, drop = FALSE) +
+  scale_x_continuous(
+    limits = c(0, 0.8),
+    breaks = seq(0, 0.8, by = 0.2),
+    labels = scales::number_format(accuracy = 0.1)
+  ) +
+  scale_y_continuous(
+    breaks = seq_along(country_levels) * country_gap,
+    labels = country_levels,
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    x = "Share of unique views by gender",
+    y = NULL,
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey80", color = "grey40"),
+    strip.text = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 9),
+    axis.title.x = element_text(size = 9),
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.45, "cm")
+  )
+
+plot_extremist_gender_bar
+
+ggsave(
+  filename = file.path(path_figures, "bar_share_views_by_gender_extremist.pdf"),
+  plot = plot_extremist_gender_bar,
+  width = 8,
+  height = 8,
+  device = cairo_pdf
+)
+```
+
+## Figure 4b: Excess male share maps by ideological bloc
+
+```{r}
+fig4b_df <- model_df %>%
+  group_by(country, extremist) %>%
+  summarize(
+    excess_male_audience = mean(excess_male_audience, na.rm = TRUE),
+    actual_gender_distribution_unique_views_male = mean(actual_gender_distribution_unique_views_male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  right_join(eu, by = c("country" = "ISO_A2_EH")) %>%
+  mutate(extremist = fct_relevel(extremist, "Farleft", "Center", "Farright")) %>%
+  drop_na(extremist) %>%
+  st_as_sf()
+
+map_extremist_excess_male <- map_base +
+  geom_sf(data = fig4b_df, aes(geometry = geometry, fill = excess_male_audience), color = "white", size = 0.1) +
+  coord_sf(crs = lambert_crs, xlim = xlim_europe, ylim = ylim_europe) +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkblue",
+    midpoint = 0,
+    limits = c(-0.2, 0.6),
+    breaks = seq(-0.2, 0.6, 0.2),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  facet_wrap(~ extremist, nrow = 1, ncol = 3) +
+  guides(
+    fill = guide_colorbar(barwidth = unit(10, "cm"), barheight = unit(0.5, "cm"), order = 1)
+  )
+
+map_extremist_excess_male
+
+ggsave(
+  filename = str_c(path_figures, "map_excess_views_male_extremist_new.pdf"),
+  plot = map_extremist_excess_male,
+  width = 20,
+  height = 10,
+  units = "cm"
+)
+```
+
+## Figure 5: Extremism coefficient plot
+
+```{r}
+df_plot_extremist <- coef_extremist_media %>%
+  filter(str_detect(term, "extremist")) %>%
+  mutate(term = str_remove(term, "extremist"))
+
+coeff_plot_extremist <- ggplot(
+  data = df_plot_extremist,
+  mapping = aes(x = term, y = estimate, fill = term, color = term, shape = term)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange(
+    aes(ymin = conf.low.99, ymax = conf.high.99, fill = term, color = term),
+    position = position_dodge(width = 0.6),
+    linewidth = 0.6,
+    size = 0.5
+  ) +
+  geom_pointrange(
+    aes(ymin = conf.low.95, ymax = conf.high.95, fill = term, color = term),
+    position = position_dodge(width = 0.6),
+    linewidth = 1.2,
+    size = 0.5
+  ) +
+  coord_flip() +
+  labs(x = "", y = "") +
+  scale_fill_manual(values = extremist_colors[c(1, 3)]) +
+  scale_color_manual(values = extremist_colors[c(1, 3)]) +
+  scale_shape_manual(values = c(21, 23)) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 24)
+  ) +
+  ylab("Coefficient")
+
+coeff_plot_extremist
+
+ggsave(
+  filename = str_c(path_figures, "coeff_plot_extremist_cov_.pdf"),
+  plot = coeff_plot_extremist,
+  width = 10,
+  height = 5,
+  units = "cm"
+)
+```
+
+# Supplement B: Robustness checks
+
+## B.1 Alternative dependent variable (male share instead of excess male share)
+
+```{r}
+# Alternative dependent variable: share of unique views by male users
+formula_extremist_dep <- as.formula(str_c(
+  "actual_gender_distribution_unique_views_male ~ extremist + ",
+  paste(covariates_media, collapse = " + "),
+  " + country"
+))
+
+lm_extremist_dep <- lm(formula = formula_extremist_dep, data = model_df_media)
+inferece_extremist_dep <- coeftest(
+  lm_extremist_dep,
+  vcov. = vcovCL(lm_extremist_dep, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_extremist_dep <- extract_coef_inference(inferece_extremist_dep)
+coef_extremist_dep %>% filter(str_detect(term, "extremist"))
+
+formula_populist_dep <- as.formula(str_c(
+  "actual_gender_distribution_unique_views_male ~ populist + ",
+  paste(covariates_media, collapse = " + "),
+  " + country"
+))
+
+lm_populist_dep <- lm(formula = formula_populist_dep, data = model_df_media)
+inferece_populist_dep <- coeftest(
+  lm_populist_dep,
+  vcov. = vcovCL(lm_populist_dep, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_populist_dep <- extract_coef_inference(inferece_populist_dep)
+coef_populist_dep %>% filter(term == "populistPopulist")
+```
+
+## B.2 Alternative model specification (country-level male share controls, no country FE)
+
+```{r}
+formula_extremist_male <- as.formula(str_c(
+  "excess_male_audience ~ extremist + ",
+  paste(c(covariates_media, male_share_country), collapse = " + ")
+))
+
+lm_extremist_male <- lm(formula = formula_extremist_male, data = model_df_media)
+inference_extremist_male <- coeftest(
+  lm_extremist_male,
+  vcov. = vcovCL(lm_extremist_male, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_extremist_male <- extract_coef_inference(inference_extremist_male)
+coef_extremist_male %>% filter(str_detect(term, "extremist"))
+
+formula_populist_male <- as.formula(str_c(
+  "excess_male_audience ~ populist + ",
+  paste(c(covariates_media, male_share_country), collapse = " + ")
+))
+
+lm_populist_male <- lm(formula = formula_populist_male, data = model_df_media)
+inference_populist_male <- coeftest(
+  lm_populist_male,
+  vcov. = vcovCL(lm_populist_male, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_populist_male <- extract_coef_inference(inference_populist_male)
+coef_populist_male %>% filter(term == "populistPopulist")
+```
+
+## B.3 Data sample restrictions
+
+```{r}
+election_date <- as.Date("2024-06-09")
+
+model_df_2_months <- model_df_media %>%
+  filter(ad_creation_time >= (election_date - months(2)))
+
+lm_populist_2m <- lm(formula_populist_media, data = model_df_2_months)
+inference_populist_2m <- coeftest(
+  lm_populist_2m,
+  vcov. = vcovCL(lm_populist_2m, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_populist_2m <- extract_coef_inference(inference_populist_2m)
+coef_populist_2m %>% filter(term == "populistPopulist")
+
+model_df_1_month <- model_df_media %>%
+  filter(ad_creation_time >= (election_date - months(1)))
+
+lm_populist_1m <- lm(formula_populist_media, data = model_df_1_month)
+inference_populist_1m <- coeftest(
+  lm_populist_1m,
+  vcov. = vcovCL(lm_populist_1m, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+coef_populist_1m <- extract_coef_inference(inference_populist_1m)
+coef_populist_1m %>% filter(term == "populistPopulist")
+```
+
+## B.4 Modeling approaches
+
+```{r}
+# Propensity score matching for populist vs. non-populist ads
+psm_populist <- perform_psm(
+  data = model_df_media,
+  balancing_vars = c(covariates_media, "country"),
+  treatment_var = "populist",
+  outcome_var = "actual_gender_distribution_unique_views_male"
+)
+
+print(psm_populist$balancing_tab)
+summary(psm_populist$lm_model_adj)
+print(psm_populist$ATE)
+
+# Mixed-effects model with random intercepts for country
+formula_populist_media_random <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_media, collapse = " + "), " + (1 | country)"
+))
+
+lm_populist_media_random <- lmer(formula_populist_media_random, data = model_df_media, REML = FALSE)
+summary(lm_populist_media_random)
+```
+
+## B.5 Sensitivity to covariate selection
+
+```{r}
+formula_base <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_base, collapse = " + "), " + country"
+))
+
+formula_age <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_age, collapse = " + "), " + country"
+))
+
+formula_media <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_media_only, collapse = " + "), " + country"
+))
+
+formula_full <- as.formula(str_c(
+  dep_var, " ~ populist + ", paste(covariates_media, collapse = " + "), " + country"
+))
+
+lm_base <- lm(formula_base, data = model_df_media)
+lm_age <- lm(formula_age, data = model_df_media)
+lm_media <- lm(formula_media, data = model_df_media)
+lm_full <- lm(formula_full, data = model_df_media)
+
+extract_populist_coef <- function(model, model_name) {
+  inference <- coeftest(model, vcov. = vcovCL(model, cluster = ~ national_party, type = "HC1", cadjust = TRUE))
+  coef_df <- tidy(inference, conf.int = TRUE, conf.level = 0.95)
+
+  coef_df %>%
+    filter(term == "populistPopulist") %>%
+    mutate(model_spec = model_name)
+}
+
+ablation_results <- bind_rows(
+  extract_populist_coef(lm_base, "1. Base Controls Only"),
+  extract_populist_coef(lm_media, "2. Base + Media (No Age)"),
+  extract_populist_coef(lm_age, "3. Base + Age (No Media)"),
+  extract_populist_coef(lm_full, "4. Full Model (Base + Age + Media)")
+)
+
+print(ablation_results %>% select(model_spec, estimate, std.error, p.value, conf.low, conf.high))
+
+ablation_plot <- ggplot(ablation_results, aes(x = estimate, y = forcats::fct_rev(model_spec))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    color = "darkred",
+    fill = "darkred",
+    shape = 21,
+    size = 1,
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Covariate Ablation: Effect of Populism on Male Audience Share",
+    subtitle = "Comparing model specifications with and without age/media controls",
+    x = "Estimated Effect on Excess Male Share",
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.y = element_text(color = "black", size = 12, face = "bold")
+  )
+
+print(ablation_plot)
+```
+
+# Supplement C: Interaction between populism and political extremism
+
+```{r}
+formula_interaction <- as.formula(
+  str_c(
+    "excess_male_audience ~ populist * extremist + ",
+    paste(covariates_media, collapse = " + "),
+    " + country"
+  )
+)
+
+lm_interaction <- lm(formula_interaction, data = model_df_media)
+
+inference_interaction <- coeftest(
+  lm_interaction,
+  vcov. = vcovCL(lm_interaction, cluster = ~ national_party, type = "HC1", cadjust = TRUE)
+)
+
+coef_interaction_df <- tidy(inference_interaction, conf.int = TRUE, conf.level = 0.95)
+
+coef_interaction_df %>%
+  filter(grepl("populist|extremist", term)) %>%
+  select(term, estimate, std.error, p.value, conf.low, conf.high)
+```
+
+# Multicollinearity diagnostic reported in the paper
+
+```{r}
+library(car)
+
+calculate_vif_controls <- function(data,
+                                   controls = covariates_media,
+                                   include_country = TRUE) {
+  rhs_vars <- controls
+
+  if (include_country) {
+    rhs_vars <- c(rhs_vars, "country")
+  }
+
+  vif_formula <- as.formula(
+    str_c("actual_gender_distribution_unique_views_male ~ ", paste(rhs_vars, collapse = " + "))
+  )
+
+  vif_model <- lm(
+    formula = vif_formula,
+    data = data
+  )
+
+  vif_values <- car::vif(vif_model)
+
+  if (is.matrix(vif_values)) {
+    vif_df <- as.data.frame(vif_values) %>%
+      rownames_to_column("term") %>%
+      mutate(
+        VIF_adjusted = GVIF^(1 / (2 * Df))
+      ) %>%
+      arrange(desc(VIF_adjusted))
+  } else {
+    vif_df <- tibble(
+      term = names(vif_values),
+      VIF = as.numeric(vif_values)
+    ) %>%
+      arrange(desc(VIF))
+  }
+
+  return(vif_df)
+}
+
+vif_controls <- calculate_vif_controls(
+  data = model_df_media,
+  controls = covariates_media,
+  include_country = TRUE
+)
+
+vif_controls
+```
