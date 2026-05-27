@@ -1,9 +1,4 @@
----
-title: "analysis_EU_election_MVP"
-author: "Dominik Bär"
-date: "2025-01-30"
-output: html_document
----
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
@@ -12,19 +7,12 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # File description
 
 ```{r}
-# Reviewer-facing MVP for the paper "Gender-based discrepancies in the algorithmic delivery
-# of political ads on social media".
-#
-# Scope retained from the original analysis file:
 # - Descriptive analysis for populist vs. non-populist ads (Figure 1)
 # - Main regression and marginal effect for populist ads (Figures 2 and 3)
 # - Descriptive analysis for far-left / center / far-right ads (Figure 4)
 # - Extremism regression (Figure 5)
 # - Supplement B robustness checks
 # - Supplement C interaction between populism and political extremism
-#
-# Exploratory sections not reported in the paper were removed to make the script suitable
-# for reviewer replication.
 ```
 
 # Set up environment
